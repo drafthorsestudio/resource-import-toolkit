@@ -5,8 +5,16 @@
  * Matches CSV Author Email / Author Name against Consultant custom posts
  * and generates matched, unmatched, and compiled CSV exports.
  *
- * @since   1.0.0
- * @version 3.0.0
+ * v3.5.0 changes:
+ * - Skips rows that already have a Consultant ID (preserves pipe-delimited IDs)
+ * - Handles pipe-delimited Author Names: splits and matches each individually
+ * - Handles pipe-delimited Author Emails: pairs with corresponding names
+ * - Outputs matched IDs as pipe-delimited for multi-author rows
+ * - Adds last-name validation to fuzzy matching to reduce false positives
+ * - Added "Dr" prefix stripping and additional credentials (FAAFP, RSPS, LCAS, CCS, LP)
+ *
+ * @since   3.0.0
+ * @version 3.5.0
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -28,6 +36,8 @@ class RIT_Consultant_Matcher {
                 <h2>Upload CSV</h2>
                 <p>Upload a CSV file containing <code>Author Email</code> and <code>Author Name</code> columns.
                    The plugin will attempt to match each row against existing <strong>Consultant</strong> posts.</p>
+                <p>Rows that already have a <code>Consultant ID</code> will be preserved as-is (including pipe-delimited multi-author IDs).<br>
+                   Pipe-delimited author names are split and matched individually.</p>
 
                 <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" enctype="multipart/form-data">
                     <?php wp_nonce_field( 'rit_consultant_match', 'rit_nonce' ); ?>
@@ -69,28 +79,32 @@ class RIT_Consultant_Matcher {
 
             <table class="rit-stats-table widefat striped" style="max-width:420px;">
                 <tbody>
-                    <tr><td>Total rows processed</td><td><?php echo (int) $results['total']; ?></td></tr>
+                    <tr><td>Total rows in CSV</td><td><?php echo (int) $results['total']; ?></td></tr>
+                    <tr><td>Preserved (already had ID)</td><td><?php echo (int) $results['preserved']; ?></td></tr>
                     <tr><td>Exact name matches</td><td><?php echo (int) $results['exact_name']; ?></td></tr>
                     <tr><td>Fuzzy name matches</td><td><?php echo (int) $results['fuzzy_name']; ?></td></tr>
                     <tr><td>Exact email matches</td><td><?php echo (int) $results['exact_email']; ?></td></tr>
                     <tr><td>Fuzzy email matches</td><td><?php echo (int) $results['fuzzy_email']; ?></td></tr>
-                    <tr><td>Skipped (multi-author)</td><td><?php echo (int) $results['skipped']; ?></td></tr>
+                    <tr><td>Partially matched (multi-author)</td><td><?php echo (int) $results['partial']; ?></td></tr>
                     <tr><td>Unmatched rows</td><td><?php echo (int) $results['unmatched']; ?></td></tr>
                 </tbody>
             </table>
 
             <p style="margin-top:15px;">
                 <span class="dashicons dashicons-download"></span>
-                <a href="<?php echo esc_url( $base_url . $results['matched_file'] ); ?>">Download Matched CSV</a>
+                <a href="<?php echo esc_url( $base_url . $results['compiled_file'] ); ?>">Download Compiled CSV (all rows — ready for review)</a>
             </p>
-            <p>
-                <span class="dashicons dashicons-download"></span>
-                <a href="<?php echo esc_url( $base_url . $results['unmatched_file'] ); ?>">Download Unmatched CSV</a>
-            </p>
-            <p>
-                <span class="dashicons dashicons-download"></span>
-                <a href="<?php echo esc_url( $base_url . $results['compiled_file'] ); ?>">Download Compiled CSV (all rows — ready for Resource Importer)</a>
-            </p>
+
+            <?php if ( ! empty( $results['log'] ) ) : ?>
+                <h3>Log</h3>
+                <div class="rit-log">
+                    <?php foreach ( $results['log'] as $entry ) : ?>
+                        <div class="<?php echo esc_attr( $entry['level'] ); ?>">
+                            <?php echo esc_html( $entry['msg'] ); ?>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
         </div>
         <?php
     }
@@ -118,65 +132,115 @@ class RIT_Consultant_Matcher {
 
         $consultants = self::load_consultants();
 
-        $matched   = array();
-        $unmatched = array();
-        $skipped   = array();
-
+        $log   = array();
         $stats = array(
             'exact_name'  => 0,
             'fuzzy_name'  => 0,
             'exact_email' => 0,
             'fuzzy_email' => 0,
+            'preserved'   => 0,
+            'partial'     => 0,
+            'unmatched'   => 0,
         );
 
-        foreach ( $rows as $row ) {
-            $author_email = isset( $row['Author Email'] ) ? trim( $row['Author Email'] ) : '';
-            $author_name  = isset( $row['Author Name'] ) ? trim( $row['Author Name'] ) : '';
+        $output_rows = array();
 
-            if ( self::is_multi_author( $author_name ) ) {
-                $row['Consultant ID'] = '';
-                $row['Match Type']    = 'skipped_multi_author';
-                $skipped[]            = $row;
+        foreach ( $rows as $i => $row ) {
+            $row_num      = $i + 2;
+            $author_name  = isset( $row['Author Name'] ) ? trim( $row['Author Name'] ) : '';
+            $author_email = isset( $row['Author Email'] ) ? trim( $row['Author Email'] ) : '';
+            $existing_id  = isset( $row['Consultant ID'] ) ? trim( $row['Consultant ID'] ) : '';
+
+            // Skip rows that already have a Consultant ID.
+            if ( $existing_id !== '' ) {
+                $row['Match Type'] = isset( $row['Match Type'] ) ? $row['Match Type'] : 'preserved';
+                $log[] = array( 'level' => 'ok', 'msg' => "Row {$row_num}: \"{$author_name}\" — already has ID ({$existing_id}). Preserved." );
+                $stats['preserved']++;
+                $output_rows[] = $row;
                 continue;
             }
 
-            $match = self::find_consultant_match( $author_email, $author_name, $consultants );
+            // Split pipe-delimited authors.
+            $names  = array_map( 'trim', explode( '|', $author_name ) );
+            $emails = array_map( 'trim', explode( '|', $author_email ) );
 
-            if ( $match ) {
-                $row['Consultant ID'] = $match['id'];
-                $row['Match Type']    = $match['type'];
-                $matched[]            = $row;
-                $stats[ $match['type'] ]++;
-            } else {
-                $row['Consultant ID'] = '';
-                $row['Match Type']    = '';
-                $unmatched[]          = $row;
+            // Pad emails to match names length.
+            while ( count( $emails ) < count( $names ) ) {
+                $emails[] = '';
             }
+
+            $matched_ids   = array();
+            $match_types   = array();
+            $author_log    = array();
+            $all_matched   = true;
+
+            foreach ( $names as $idx => $name ) {
+                $email = isset( $emails[ $idx ] ) ? $emails[ $idx ] : '';
+
+                if ( $name === '' && $email === '' ) {
+                    $matched_ids[]  = '';
+                    $match_types[]  = '';
+                    $all_matched    = false;
+                    continue;
+                }
+
+                $match = self::find_consultant_match( $email, $name, $consultants );
+
+                if ( $match ) {
+                    $matched_ids[]  = $match['id'];
+                    $match_types[]  = $match['type'];
+                    $stats[ $match['type'] ]++;
+
+                    $matched_title = get_the_title( $match['id'] );
+                    $author_log[]  = "\"{$name}\" → #{$match['id']} \"{$matched_title}\" ({$match['type']})";
+                } else {
+                    $matched_ids[] = '';
+                    $match_types[] = '';
+                    $all_matched   = false;
+                    $author_log[]  = "\"{$name}\" — no match";
+                }
+            }
+
+            // Build pipe-delimited output.
+            $row['Consultant ID'] = implode( '|', $matched_ids );
+            $row['Match Type']    = implode( '|', $match_types );
+
+            // Determine overall row status.
+            $has_any_match = (bool) array_filter( $matched_ids );
+
+            if ( $has_any_match && $all_matched ) {
+                $log_msg = "Row {$row_num}: " . implode( '; ', $author_log );
+                $log[]   = array( 'level' => 'ok', 'msg' => $log_msg );
+            } elseif ( $has_any_match ) {
+                $log_msg = "Row {$row_num}: PARTIAL — " . implode( '; ', $author_log );
+                $log[]   = array( 'level' => 'skip', 'msg' => $log_msg );
+                $stats['partial']++;
+            } else {
+                $log_msg = "Row {$row_num}: " . implode( '; ', $author_log );
+                $log[]   = array( 'level' => 'error', 'msg' => $log_msg );
+                $stats['unmatched']++;
+            }
+
+            $output_rows[] = $row;
         }
 
-        $timestamp       = date( 'Y-m-d_His' );
-        $matched_file    = "matched-{$timestamp}.csv";
-        $unmatched_file  = "unmatched-{$timestamp}.csv";
-        $compiled_file   = "compiled-{$timestamp}.csv";
-
-        $all_processed = array_merge( $matched, $unmatched, $skipped );
-
-        self::write_full_csv( $matched_file, $matched, $rows );
-        self::write_unmatched_csv( $unmatched_file, array_merge( $unmatched, $skipped ) );
-        self::write_full_csv( $compiled_file, $all_processed, $rows );
+        // Write compiled output CSV.
+        $timestamp     = date( 'Y-m-d_His' );
+        $compiled_file = "compiled-{$timestamp}.csv";
+        self::write_output_csv( $compiled_file, $output_rows );
 
         set_transient( 'rit_matcher_results_' . get_current_user_id(), array(
-            'total'          => count( $rows ),
-            'exact_name'     => $stats['exact_name'],
-            'fuzzy_name'     => $stats['fuzzy_name'],
-            'exact_email'    => $stats['exact_email'],
-            'fuzzy_email'    => $stats['fuzzy_email'],
-            'skipped'        => count( $skipped ),
-            'unmatched'      => count( $unmatched ),
-            'matched_file'   => $matched_file,
-            'unmatched_file' => $unmatched_file,
-            'compiled_file'  => $compiled_file,
-        ), 300 );
+            'total'         => count( $rows ),
+            'preserved'     => $stats['preserved'],
+            'exact_name'    => $stats['exact_name'],
+            'fuzzy_name'    => $stats['fuzzy_name'],
+            'exact_email'   => $stats['exact_email'],
+            'fuzzy_email'   => $stats['fuzzy_email'],
+            'partial'       => $stats['partial'],
+            'unmatched'     => $stats['unmatched'],
+            'compiled_file' => $compiled_file,
+            'log'           => $log,
+        ), 600 );
 
         wp_safe_redirect( admin_url( 'admin.php?page=rit-consultant-matcher' ) );
         exit;
@@ -186,18 +250,154 @@ class RIT_Consultant_Matcher {
     //  Matching Logic
     // =========================================================================
 
-    private static function is_multi_author( $name ) {
-        if ( preg_match( '/\b(and)\b|[&;]/i', $name ) ) {
-            return true;
+    private static function load_consultants() {
+        $consultants = array();
+
+        $query = new WP_Query( array(
+            'post_type'      => 'consultant',
+            'posts_per_page' => -1,
+            'post_status'    => 'publish',
+            'fields'         => 'ids',
+        ) );
+
+        if ( ! empty( $query->posts ) ) {
+            foreach ( $query->posts as $post_id ) {
+                $title = get_the_title( $post_id );
+                $consultants[] = array(
+                    'id'               => $post_id,
+                    'title'            => $title,
+                    'normalized_title' => self::normalize_name( $title ),
+                    'email'            => strtolower( trim( (string) get_field( 'email', $post_id ) ) ),
+                );
+            }
         }
-        return false;
+
+        return $consultants;
     }
 
+    /**
+     * Find a matching consultant post.
+     *
+     * 1. Exact name match (normalized).
+     * 2. Fuzzy name match (≥85% similarity OR ≤2 Levenshtein) WITH last-name validation.
+     * 3. Exact email match.
+     * 4. Fuzzy email match (≥85% similarity OR ≤3 Levenshtein).
+     */
+    private static function find_consultant_match( $author_email, $author_name, $consultants ) {
+        $email_lower     = strtolower( trim( $author_email ) );
+        $name_normalized = self::normalize_name( $author_name );
+
+        // Extract last name for fuzzy validation.
+        $author_last = self::extract_last_name( $name_normalized );
+
+        // 1. Exact name match.
+        if ( $name_normalized !== '' ) {
+            foreach ( $consultants as $c ) {
+                if ( $c['normalized_title'] === $name_normalized ) {
+                    return array( 'id' => $c['id'], 'type' => 'exact_name' );
+                }
+            }
+        }
+
+        // 2. Fuzzy name match with last-name validation.
+        if ( $name_normalized !== '' && $author_last !== '' ) {
+            $best_score = 0;
+            $best_match = null;
+
+            foreach ( $consultants as $c ) {
+                if ( $c['normalized_title'] === '' ) {
+                    continue;
+                }
+
+                similar_text( $name_normalized, $c['normalized_title'], $pct );
+                $lev = levenshtein( $name_normalized, $c['normalized_title'] );
+
+                if ( ( $pct >= 85 || $lev <= 2 ) && $pct > $best_score ) {
+                    // Validate: last names must also fuzzy-match.
+                    $c_last = self::extract_last_name( $c['normalized_title'] );
+                    if ( $c_last !== '' ) {
+                        similar_text( $author_last, $c_last, $last_pct );
+                        $last_lev = levenshtein( $author_last, $c_last );
+                        if ( $last_pct < 80 && $last_lev > 2 ) {
+                            continue; // Last names are too different — skip.
+                        }
+                    }
+
+                    $best_score = $pct;
+                    $best_match = $c;
+                }
+            }
+
+            if ( $best_match ) {
+                return array( 'id' => $best_match['id'], 'type' => 'fuzzy_name' );
+            }
+        }
+
+        // 3. Exact email match.
+        if ( $email_lower !== '' ) {
+            foreach ( $consultants as $c ) {
+                if ( $c['email'] !== '' && $email_lower === $c['email'] ) {
+                    return array( 'id' => $c['id'], 'type' => 'exact_email' );
+                }
+            }
+        }
+
+        // 4. Fuzzy email match — require same domain.
+        if ( $email_lower !== '' ) {
+            $author_domain = strstr( $email_lower, '@' );
+            $best_score    = 0;
+            $best_match    = null;
+
+            foreach ( $consultants as $c ) {
+                if ( $c['email'] === '' ) {
+                    continue;
+                }
+
+                // Only fuzzy-match emails with the same domain.
+                $c_domain = strstr( $c['email'], '@' );
+                if ( $author_domain !== $c_domain ) {
+                    continue;
+                }
+
+                similar_text( $email_lower, $c['email'], $pct );
+                $lev = levenshtein( $email_lower, $c['email'] );
+
+                if ( ( $pct >= 85 || $lev <= 3 ) && $pct > $best_score ) {
+                    $best_score = $pct;
+                    $best_match = $c;
+                }
+            }
+
+            if ( $best_match ) {
+                return array( 'id' => $best_match['id'], 'type' => 'fuzzy_email' );
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract the last name (last word) from a normalized name string.
+     */
+    private static function extract_last_name( $normalized_name ) {
+        $parts = explode( ' ', trim( $normalized_name ) );
+        return count( $parts ) > 0 ? end( $parts ) : '';
+    }
+
+    /**
+     * Normalize a name: strip credentials, honorifics, handle "Last, First", lowercase.
+     */
     private static function normalize_name( $name ) {
         $name = trim( $name );
         if ( $name === '' ) {
             return '';
         }
+
+        // Strip "Dr." / "Dr" prefix.
+        $name = preg_replace( '/^\s*Dr\.?\s+/i', '', $name );
+
+        // Strip "Illustrator:" and similar prefixes.
+        $name = preg_replace( '/^\s*\w+:\s*/', '', $name );
 
         $credentials = array(
             'PhD', 'PharmD', 'PsyD', 'EdD', 'DrPH', 'ScD', 'DMin', 'DBA', 'JD', 'DDS', 'DMD', 'DO', 'DPM', 'DC',
@@ -205,14 +405,22 @@ class RIT_Consultant_Matcher {
             'BSN', 'BS', 'BA', 'BSW',
             'RN', 'LPN', 'NP', 'CNS', 'CRNA', 'CNM', 'APRN', 'FNP',
             'LCSW', 'LMSW', 'LMFT', 'LPC', 'LCPC', 'LCMHC', 'LMHC', 'LPCC', 'LSW',
-            'BCBA', 'CPA', 'PE', 'RA', 'AIA', 'FACHE', 'FAAN', 'FACP', 'FACS',
+            'LCAS', 'CCS', 'LP', 'RSPS', 'LICSW',
+            'BCBA', 'CPA', 'PE', 'RA', 'AIA', 'FACHE', 'FAAN', 'FACP', 'FACS', 'FAAFP', 'FAAP',
             'PA-C', 'PA', 'OT', 'PT', 'DPT', 'SLP', 'CCC-SLP',
             'CADC', 'CASAC', 'CAP', 'CRC', 'CARN', 'NCAC',
             'Jr', 'Sr', 'II', 'III', 'IV',
             'Esq', 'Ret',
         );
 
+        // Remove anything in brackets or parentheses.
         $name = preg_replace( '/\[.*?\]|\(.*?\)/', '', $name );
+
+        // Remove curly/smart quotes.
+        $name = str_replace(
+            array( "\xe2\x80\x9c", "\xe2\x80\x9d", "\xe2\x80\x98", "\xe2\x80\x99" ),
+            '', $name
+        );
 
         if ( strpos( $name, ',' ) !== false ) {
             $parts        = explode( ',', $name );
@@ -265,102 +473,6 @@ class RIT_Consultant_Matcher {
         return $name;
     }
 
-    private static function load_consultants() {
-        $consultants = array();
-
-        $query = new WP_Query( array(
-            'post_type'      => 'consultant',
-            'posts_per_page' => -1,
-            'post_status'    => 'publish',
-            'fields'         => 'ids',
-        ) );
-
-        if ( ! empty( $query->posts ) ) {
-            foreach ( $query->posts as $post_id ) {
-                $title = get_the_title( $post_id );
-                $consultants[] = array(
-                    'id'               => $post_id,
-                    'title'            => $title,
-                    'normalized_title' => self::normalize_name( $title ),
-                    'email'            => strtolower( trim( (string) get_field( 'email', $post_id ) ) ),
-                );
-            }
-        }
-
-        return $consultants;
-    }
-
-    private static function find_consultant_match( $author_email, $author_name, $consultants ) {
-        $email_lower     = strtolower( trim( $author_email ) );
-        $name_normalized = self::normalize_name( $author_name );
-
-        // 1. Exact name match.
-        if ( $name_normalized !== '' ) {
-            foreach ( $consultants as $c ) {
-                if ( $c['normalized_title'] === $name_normalized ) {
-                    return array( 'id' => $c['id'], 'type' => 'exact_name' );
-                }
-            }
-        }
-
-        // 2. Fuzzy name match.
-        if ( $name_normalized !== '' ) {
-            $best_score = 0;
-            $best_match = null;
-
-            foreach ( $consultants as $c ) {
-                if ( $c['normalized_title'] === '' ) {
-                    continue;
-                }
-                similar_text( $name_normalized, $c['normalized_title'], $pct );
-                $lev = levenshtein( $name_normalized, $c['normalized_title'] );
-
-                if ( ( $pct >= 85 || $lev <= 2 ) && $pct > $best_score ) {
-                    $best_score = $pct;
-                    $best_match = $c;
-                }
-            }
-
-            if ( $best_match ) {
-                return array( 'id' => $best_match['id'], 'type' => 'fuzzy_name' );
-            }
-        }
-
-        // 3. Exact email match.
-        if ( $email_lower !== '' ) {
-            foreach ( $consultants as $c ) {
-                if ( $c['email'] !== '' && $email_lower === $c['email'] ) {
-                    return array( 'id' => $c['id'], 'type' => 'exact_email' );
-                }
-            }
-        }
-
-        // 4. Fuzzy email match.
-        if ( $email_lower !== '' ) {
-            $best_score = 0;
-            $best_match = null;
-
-            foreach ( $consultants as $c ) {
-                if ( $c['email'] === '' ) {
-                    continue;
-                }
-                similar_text( $email_lower, $c['email'], $pct );
-                $lev = levenshtein( $email_lower, $c['email'] );
-
-                if ( ( $pct >= 85 || $lev <= 3 ) && $pct > $best_score ) {
-                    $best_score = $pct;
-                    $best_match = $c;
-                }
-            }
-
-            if ( $best_match ) {
-                return array( 'id' => $best_match['id'], 'type' => 'fuzzy_email' );
-            }
-        }
-
-        return null;
-    }
-
     // =========================================================================
     //  CSV I/O
     // =========================================================================
@@ -386,9 +498,23 @@ class RIT_Consultant_Matcher {
             return new WP_Error( 'csv_columns', 'CSV must contain "Author Email" and "Author Name" columns.' );
         }
 
+        // Ensure Consultant ID and Match Type columns exist.
+        if ( ! in_array( 'Consultant ID', $headers, true ) ) {
+            $headers[] = 'Consultant ID';
+        }
+        if ( ! in_array( 'Match Type', $headers, true ) ) {
+            $headers[] = 'Match Type';
+        }
+
+        $col_count = count( $headers );
+
         $rows = array();
         while ( ( $data = fgetcsv( $handle ) ) !== false ) {
-            if ( count( $data ) === count( $headers ) ) {
+            // Pad short rows with empty values for added columns.
+            while ( count( $data ) < $col_count ) {
+                $data[] = '';
+            }
+            if ( count( $data ) === $col_count ) {
                 $rows[] = array_combine( $headers, $data );
             }
         }
@@ -397,51 +523,21 @@ class RIT_Consultant_Matcher {
         return $rows;
     }
 
-    private static function get_export_dir() {
+    private static function write_output_csv( $filename, $data_rows ) {
         $upload_dir = wp_upload_dir();
         $dir        = $upload_dir['basedir'] . '/rit-exports/';
-
         if ( ! file_exists( $dir ) ) {
             wp_mkdir_p( $dir );
             file_put_contents( $dir . 'index.php', '<?php // Silence is golden.' );
         }
 
-        return $dir;
-    }
-
-    private static function write_full_csv( $filename, $data_rows, $all_rows ) {
-        $dir    = self::get_export_dir();
         $handle = fopen( $dir . $filename, 'w' );
-
         if ( ! empty( $data_rows ) ) {
-            $headers = array_keys( $data_rows[0] );
-        } elseif ( ! empty( $all_rows ) ) {
-            $headers = array_merge( array_keys( $all_rows[0] ), array( 'Consultant ID', 'Match Type' ) );
-        } else {
-            $headers = array( 'Author Email', 'Author Name', 'Consultant ID', 'Match Type' );
+            fputcsv( $handle, array_keys( $data_rows[0] ) );
+            foreach ( $data_rows as $row ) {
+                fputcsv( $handle, array_values( $row ) );
+            }
         }
-
-        fputcsv( $handle, $headers );
-
-        foreach ( $data_rows as $row ) {
-            fputcsv( $handle, array_values( $row ) );
-        }
-
-        fclose( $handle );
-    }
-
-    private static function write_unmatched_csv( $filename, $unmatched_rows ) {
-        $dir    = self::get_export_dir();
-        $handle = fopen( $dir . $filename, 'w' );
-
-        fputcsv( $handle, array( 'Author Name', 'Author Email' ) );
-
-        foreach ( $unmatched_rows as $row ) {
-            $name  = isset( $row['Author Name'] ) ? $row['Author Name'] : '';
-            $email = isset( $row['Author Email'] ) ? $row['Author Email'] : '';
-            fputcsv( $handle, array( $name, $email ) );
-        }
-
         fclose( $handle );
     }
 

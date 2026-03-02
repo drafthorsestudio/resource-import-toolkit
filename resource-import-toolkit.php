@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: ORN Resource Import Toolkit
- * Description: All-in-one toolkit for migrating resources from a legacy system: match consultants, import resource posts, attach files, and assign taxonomy terms &amp; audiences.
- * Version: 3.1.0
+ * Description: All-in-one toolkit for migrating resources from a legacy system: match consultants, import resource posts, attach files, assign taxonomy terms &amp; audiences, and create consultant user accounts.
+ * Version: 3.5.0
  * Author: KC Web Programmers
  * License: GPL v2 or later
  * Requires at least: 5.8
@@ -21,6 +21,7 @@ require_once RIT_PLUGIN_DIR . 'includes/class-rit-consultant-matcher.php';
 require_once RIT_PLUGIN_DIR . 'includes/class-rit-resource-importer.php';
 require_once RIT_PLUGIN_DIR . 'includes/class-rit-attachment-importer.php';
 require_once RIT_PLUGIN_DIR . 'includes/class-rit-taxonomy-assigner.php';
+require_once RIT_PLUGIN_DIR . 'includes/class-rit-consultant-user-manager.php';
 
 class Resource_Import_Toolkit {
 
@@ -31,6 +32,7 @@ class Resource_Import_Toolkit {
         // Form handlers.
         add_action( 'admin_post_rit_consultant_match', array( 'RIT_Consultant_Matcher', 'handle_form' ) );
         add_action( 'admin_post_rit_resource_import', array( 'RIT_Resource_Importer', 'handle_form' ) );
+        add_action( 'admin_post_rit_consultant_user_create', array( 'RIT_Consultant_User_Manager', 'handle_form' ) );
 
         // Attachment Importer uses AJAX batch processing.
         RIT_Attachment_Importer::register_ajax();
@@ -93,6 +95,16 @@ class Resource_Import_Toolkit {
             'rit-taxonomy-assigner',
             array( 'RIT_Taxonomy_Assigner', 'render_page' )
         );
+
+        // Submenu: Consultant User Manager.
+        add_submenu_page(
+            'rit-consultant-matcher',
+            'Consultant User Manager',
+            '5. User Manager',
+            'manage_options',
+            'rit-consultant-user-manager',
+            array( 'RIT_Consultant_User_Manager', 'render_page' )
+        );
     }
 
     /**
@@ -105,6 +117,7 @@ class Resource_Import_Toolkit {
             'resource-toolkit_page_rit-resource-importer',
             'resource-toolkit_page_rit-attachment-importer',
             'resource-toolkit_page_rit-taxonomy-assigner',
+            'resource-toolkit_page_rit-consultant-user-manager',
         );
         if ( ! in_array( $hook, $our_pages, true ) ) {
             return;
